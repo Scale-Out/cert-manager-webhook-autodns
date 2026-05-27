@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -181,7 +182,8 @@ func (c *autoDNSProviderSolver) resolveSecret(namespace string, ref secretKeyRef
 }
 
 func callApi(method string, body []byte, cfg autoDNSProviderConfig, user, pass string) error {
-	url := cfg.URL + "/zone/" + cfg.Zone + "/" + cfg.NameServer
+	zone := strings.TrimSuffix(cfg.Zone, ".")
+	url := cfg.URL + "/zone/" + zone + "/" + cfg.NameServer
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
 	if err != nil {
 		return fmt.Errorf("unable to build request: %v", err)
@@ -203,7 +205,18 @@ func callApi(method string, body []byte, cfg autoDNSProviderConfig, user, pass s
 	}
 
 	respBody, _ := io.ReadAll(resp.Body)
-	text := fmt.Sprintf("AutoDNS API error: status=%s url=%s method=%s body=%s", resp.Status, url, method, string(respBody))
+	bodyStr := string(respBody)
+
+	// EF02022 = duplicate record on add (Present already applied).
+	// EF02021 = record not found on remove (CleanUp already applied).
+	// cert-manager calls Present/CleanUp repeatedly during reconcile loops;
+	// treat these as success to keep both operations idempotent.
+	if strings.Contains(bodyStr, "EF02022") || strings.Contains(bodyStr, "EF02021") {
+		klog.Infof("AutoDNS idempotent no-op (status=%s body=%s)", resp.Status, bodyStr)
+		return nil
+	}
+
+	text := fmt.Sprintf("AutoDNS API error: status=%s url=%s method=%s body=%s", resp.Status, url, method, bodyStr)
 	klog.Error(text)
 	return errors.New(text)
 }

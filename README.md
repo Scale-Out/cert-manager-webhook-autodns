@@ -1,112 +1,128 @@
-# ACME webhook for AutoDNS API
+# cert-manager-webhook-autodns
 
-Solver enabling cert-manager to interact with [AutoDNS API](https://help.internetx.com/display/APIXMLEN/JSON+API+Basics).
+ACME DNS-01 solver webhook for [cert-manager](https://cert-manager.io/) that uses the
+[InterNetX AutoDNS JSON API](https://help.internetx.com/display/APIXMLEN/JSON+API+Basics)
+to provision `_acme-challenge` TXT records.
 
-> This Solver took heavy inspiration from [cert-manager-webhook-hetzner](https://github.com/vadimkim/cert-manager-webhook-hetzner)
+Scale-Out fork of [derJD/cert-manager-webhook-autodns](https://github.com/derJD/cert-manager-webhook-autodns)
+with modernized dependencies, SecretRef-based credentials, and a manual build flow.
 
 ## Requirements
 
-* [go](https://golang.org/) >= 1.13.0
-* [helm](https://helm.sh/) >= v3.0.0
-* [kubernetes](https://kubernetes.io/) >= v1.14.0
-* [cert-manager](https://cert-manager.io/) >= 0.12.0
+- Go 1.25+
+- Helm 3
+- Kubernetes 1.27+
+- cert-manager 1.16+
 
-## Installation
+## Build & push image
 
-### cert-manager
-
-Follow the [instructions](https://cert-manager.io/docs/installation/) using the cert-manager documentation to install it within your cluster.
-
-### Webhook
-
-**To install the webhook run:**
+No CI is configured. Build and push manually:
 
 ```bash
-# Clone this repository and ...
-helm install --namespace cert-manager cert-manager-webhook-autodns deploy/cert-manager-webhook-autodns
+docker build -t ghcr.io/scale-out/cert-manager-webhook-autodns:0.2.0 .
+docker push ghcr.io/scale-out/cert-manager-webhook-autodns:0.2.0
 ```
 
-**Note**: The kubernetes resources used to install the Webhook should be deployed within the same namespace as the **cert-manager**.
-
-**To uninstall the webhook run:**
+Or via Makefile:
 
 ```bash
-helm uninstall --namespace cert-manager cert-manager-webhook-autodns
+make push IMAGE_TAG=0.2.0
 ```
 
-Values for customization via *values.yaml* or *--set* can be seen [here](deploy/cert-manager-webhook-autodns/values.yaml)
+## Install
 
-## Issuer
+```bash
+helm install --namespace cert-manager \
+  cert-manager-webhook-autodns \
+  deploy/cert-manager-webhook-autodns \
+  --set groupName=acme.yourdomain.tld
+```
 
-Create a `ClusterIssuer` or `Issuer` resource as following:
+The webhook reads AutoDNS credentials from Kubernetes Secrets in its release
+namespace (`cert-manager`). List allowed Secret names under `values.secretRefs`
+so RBAC permits reading them:
 
 ```yaml
-apiVersion: cert-manager.io/v1alpha2
+secretRefs:
+  - autodns-credentials
+```
+
+## Credentials Secret
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: autodns-credentials
+  namespace: cert-manager
+type: Opaque
+stringData:
+  username: your-autodns-user
+  password: your-autodns-password
+```
+
+## ClusterIssuer
+
+```yaml
+apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
-  name: letsencrypt-staging
+  name: letsencrypt-prod
 spec:
   acme:
-    # The ACME server URL
-    server: https://acme-staging-v02.api.letsencrypt.org/directory
-
-    # Email address used for ACME registration
-    email: mail@example.com # REPLACE THIS WITH YOUR EMAIL!!!
-
-    # Name of a secret used to store the ACME account private key
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: you@example.com
     privateKeySecretRef:
-      name: letsencrypt-staging
-
+      name: letsencrypt-prod-account-key
     solvers:
       - dns01:
           webhook:
-            # This group needs to be configured when installing the helm package, otherwise the webhook won't have permission to create an ACME challenge for this API group.
             groupName: acme.yourdomain.tld
             solverName: autodns
             config:
               url: https://api.autodns.com/v1
-              zone: example.com # (Optional): When not provided the Zone will obtained by cert-manager's ResolvedZone
-              nameserver: ns1.pns.de # (Mandatory): Nameserver used for RR updates
-              context: 1234567 # (Mandatory): PersonalAutoDNS Context number used for authentification
-              username: example_username # (Mandatory): Username for basic auth.
-              password: example_password # (Mandatory): Password for basic auth.
+              context: "4"               # PersonalAutoDNS context, "1" = demo
+              nameserver: ns1.pns.de     # authoritative NS for the zone
+              usernameSecretRef:
+                name: autodns-credentials
+                key: username
+              passwordSecretRef:
+                name: autodns-credentials
+                key: password
+        selector:
+          dnsZones:
+            - yourdomain.tld
 ```
 
-### Create a certificate
-
-* Create an A-Record pointing to `example-fqdn.example.com` (of course you have to replace `example-fqdn.example.com`)
-* Finally you can create certificates, for example:
+## Wildcard certificate
 
 ```yaml
-apiVersion: cert-manager.io/v1alpha2
+apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: example-cert
-  namespace: cert-manager
+  name: wildcard-yourdomain-tld
+  namespace: default
 spec:
-  dnsNames:
-    - example-fqdn.example.com
+  secretName: wildcard-yourdomain-tld-tls
   issuerRef:
-    name: letsencrypt-staging
+    name: letsencrypt-prod
     kind: ClusterIssuer
-  secretName: example-cert
+  dnsNames:
+    - "*.yourdomain.tld"
+    - "yourdomain.tld"
 ```
 
-## Development
+## Configuration reference
 
-### Running the test suite
+| Field | Required | Description |
+|-------|----------|-------------|
+| `url` | yes | AutoDNS endpoint. Live: `https://api.autodns.com/v1`, Demo: `https://api.demo.autodns.com/v1` |
+| `context` | yes | AutoDNS context (string). `"1"` = demo, `"4"` or PersonalAutoDNS context number for live |
+| `nameserver` | yes | Authoritative nameserver for the zone (e.g. `ns1.pns.de`) |
+| `usernameSecretRef.name/key` | yes | Secret reference for the AutoDNS username |
+| `passwordSecretRef.name/key` | yes | Secret reference for the AutoDNS password |
+| `zone` | no | Override resolved zone. Usually leave empty. |
 
-All DNS providers **must** run the DNS01 provider conformance testing suite,
-else they will have undetermined behavior when used with cert-manager.
+## License
 
-**It is essential that you configure and run the test suite when creating a DNS01 webhook.**
-
-Copy [config.json.sample](testdata/autoDNS/config.json.sample) to `testdata/autoDNS/config.json`
-and fill it with your actual AutoDNS authentification data and a valid zone as well as nameserver.
-
-You can then run the test suite with:
-
-```bash
-# then run the tests
-TEST_ZONE_NAME=example.com. make test
-```
+Apache License 2.0. Original work by [derJD](https://github.com/derJD).

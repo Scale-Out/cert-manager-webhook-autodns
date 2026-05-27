@@ -1,38 +1,37 @@
-OS ?= $(shell go env GOOS)
-ARCH ?= $(shell go env GOARCH)
+IMAGE_NAME  ?= ghcr.io/scale-out/cert-manager-webhook-autodns
+IMAGE_TAG   ?= 0.2.0
 
-IMAGE_NAME := "cert-manager-webhook-autodns"
-IMAGE_TAG := "latest"
-
+ENVTEST_K8S_VERSION ?= 1.31.0
 OUT := $(shell pwd)/_out
-
-KUBEBUILDER_VERSION=2.3.2
 
 $(shell mkdir -p "$(OUT)")
 
-test: _test/kubebuilder
-	go test -v .
+.PHONY: tidy build vet lint test image push template clean
 
-_test/kubebuilder:
-	curl -fsSL https://github.com/kubernetes-sigs/kubebuilder/releases/download/v$(KUBEBUILDER_VERSION)/kubebuilder_$(KUBEBUILDER_VERSION)_$(OS)_$(ARCH).tar.gz -o kubebuilder-tools.tar.gz
-	mkdir -p _test/kubebuilder
-	tar -xvf kubebuilder-tools.tar.gz
-	mv kubebuilder_$(KUBEBUILDER_VERSION)_$(OS)_$(ARCH)/bin _test/kubebuilder/
-	rm kubebuilder-tools.tar.gz
-	rm -R kubebuilder_$(KUBEBUILDER_VERSION)_$(OS)_$(ARCH)
+tidy:
+	go mod tidy
 
-clean: clean-kubebuilder
-
-clean-kubebuilder:
-	rm -Rf _test/kubebuilder
+vet:
+	go vet ./...
 
 build:
-	docker build -t "$(IMAGE_NAME):$(IMAGE_TAG)" .
+	CGO_ENABLED=0 go build -o $(OUT)/webhook -ldflags '-w -extldflags "-static"' .
 
-.PHONY: rendered-manifest.yaml
-rendered-manifest.yaml:
-	helm template \
-	    --name cert-manager-webhook-autodns \
-        --set image.repository=$(IMAGE_NAME) \
-        --set image.tag=$(IMAGE_TAG) \
-        deploy/cert-manager-webhook-autodns > "$(OUT)/rendered-manifest.yaml"
+test:
+	@which setup-envtest >/dev/null 2>&1 || go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+	KUBEBUILDER_ASSETS="$$(setup-envtest use $(ENVTEST_K8S_VERSION) -p path)" go test -v ./...
+
+image:
+	docker build -t $(IMAGE_NAME):$(IMAGE_TAG) .
+
+push: image
+	docker push $(IMAGE_NAME):$(IMAGE_TAG)
+
+template:
+	helm template cert-manager-webhook-autodns deploy/cert-manager-webhook-autodns \
+		--set groupName=acme.example.com \
+		--set image.repository=$(IMAGE_NAME) \
+		--set image.tag=$(IMAGE_TAG) > $(OUT)/rendered-manifest.yaml
+
+clean:
+	rm -Rf $(OUT)

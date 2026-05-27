@@ -2,20 +2,22 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 
-	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	"k8s.io/klog"
-
+	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 
-	"github.com/jetstack/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
-	"github.com/jetstack/cert-manager/pkg/acme/webhook/cmd"
+	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
+	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
 )
 
 var GroupName = os.Getenv("GROUP_NAME")
@@ -34,13 +36,18 @@ type autoDNSProviderSolver struct {
 	client *kubernetes.Clientset
 }
 
+type secretKeyRef struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
+}
+
 type autoDNSProviderConfig struct {
-	Zone       string `json:"zone"`
-	NameServer string `json:"nameserver"`
-	Context    string `json:"context"`
-	Username   string `json:"username"`
-	Password   string `json:"password"`
-	URL        string `json:"url"`
+	Zone              string       `json:"zone,omitempty"`
+	NameServer        string       `json:"nameserver"`
+	Context           string       `json:"context"`
+	URL               string       `json:"url"`
+	UsernameSecretRef secretKeyRef `json:"usernameSecretRef"`
+	PasswordSecretRef secretKeyRef `json:"passwordSecretRef"`
 }
 
 type AutoDNSData struct {
@@ -59,7 +66,7 @@ type AutoDNSResourceRecordData struct {
 }
 
 func (c *autoDNSProviderSolver) Name() string {
-	return "autoDNS"
+	return "autodns"
 }
 
 func (c *autoDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
@@ -67,10 +74,15 @@ func (c *autoDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	if err != nil {
 		return err
 	}
-
 	if cfg.Zone == "" {
 		cfg.Zone = ch.ResolvedZone
 	}
+
+	user, pass, err := c.resolveCredentials(ch, cfg)
+	if err != nil {
+		return err
+	}
+
 	jsonData, err := json.Marshal(AutoDNSData{
 		Origin: ch.ResolvedZone,
 		ResourceRecordsAdd: []AutoDNSResourceRecordData{
@@ -86,7 +98,7 @@ func (c *autoDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return err
 	}
 
-	return callApi("PATCH", jsonData, cfg)
+	return callApi("PATCH", jsonData, cfg, user, pass)
 }
 
 func (c *autoDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
@@ -94,10 +106,15 @@ func (c *autoDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	if err != nil {
 		return err
 	}
-
 	if cfg.Zone == "" {
 		cfg.Zone = ch.ResolvedZone
 	}
+
+	user, pass, err := c.resolveCredentials(ch, cfg)
+	if err != nil {
+		return err
+	}
+
 	jsonData, err := json.Marshal(AutoDNSData{
 		Origin: ch.ResolvedZone,
 		ResourceRecordsRem: []AutoDNSResourceRecordData{
@@ -113,7 +130,7 @@ func (c *autoDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 		return err
 	}
 
-	return callApi("PATCH", jsonData, cfg)
+	return callApi("PATCH", jsonData, cfg, user, pass)
 }
 
 func (c *autoDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
@@ -121,9 +138,7 @@ func (c *autoDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh
 	if err != nil {
 		return err
 	}
-
 	c.client = cl
-
 	return nil
 }
 
@@ -135,40 +150,60 @@ func loadConfig(cfgJSON *extapi.JSON) (autoDNSProviderConfig, error) {
 	if err := json.Unmarshal(cfgJSON.Raw, &cfg); err != nil {
 		return cfg, fmt.Errorf("error decoding solver config: %v", err)
 	}
-
 	return cfg, nil
 }
 
-func callApi(method string, body []byte, config autoDNSProviderConfig) error {
-	url := config.URL + "/zone/" + config.Zone + "/" + config.NameServer
+func (c *autoDNSProviderSolver) resolveCredentials(ch *v1alpha1.ChallengeRequest, cfg autoDNSProviderConfig) (string, string, error) {
+	user, err := c.resolveSecret(ch.ResourceNamespace, cfg.UsernameSecretRef)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve usernameSecretRef: %w", err)
+	}
+	pass, err := c.resolveSecret(ch.ResourceNamespace, cfg.PasswordSecretRef)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve passwordSecretRef: %w", err)
+	}
+	return user, pass, nil
+}
+
+func (c *autoDNSProviderSolver) resolveSecret(namespace string, ref secretKeyRef) (string, error) {
+	if ref.Name == "" || ref.Key == "" {
+		return "", fmt.Errorf("secretRef name and key must be set")
+	}
+	sec, err := c.client.CoreV1().Secrets(namespace).Get(context.TODO(), ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get secret %s/%s: %w", namespace, ref.Name, err)
+	}
+	v, ok := sec.Data[ref.Key]
+	if !ok {
+		return "", fmt.Errorf("key %q not found in secret %s/%s", ref.Key, namespace, ref.Name)
+	}
+	return string(v), nil
+}
+
+func callApi(method string, body []byte, cfg autoDNSProviderConfig, user, pass string) error {
+	url := cfg.URL + "/zone/" + cfg.Zone + "/" + cfg.NameServer
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
 	if err != nil {
-		return fmt.Errorf("unable to execute request %v", err)
+		return fmt.Errorf("unable to build request: %v", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Domainrobot-Context", config.Context)
-	req.SetBasicAuth(config.Username, config.Password)
+	req.Header.Set("X-Domainrobot-Context", cfg.Context)
+	req.SetBasicAuth(user, pass)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
-	defer func() {
-		err := resp.Body.Close()
-		if err != nil {
-			klog.Fatal(err)
-		}
-	}()
-
-	//respBody, _ := ioutil.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusOK {
 		return nil
 	}
 
-	text := "Error calling API status: " + resp.Status + " url: " + url + " method: " + method
+	respBody, _ := io.ReadAll(resp.Body)
+	text := fmt.Sprintf("AutoDNS API error: status=%s url=%s method=%s body=%s", resp.Status, url, method, string(respBody))
 	klog.Error(text)
 	return errors.New(text)
 }

@@ -1,0 +1,38 @@
+cert-manager-webhook-autodns installed.
+
+groupName: {{ .Values.groupName }}
+solverName: autodns
+
+Example ClusterIssuer:
+
+  apiVersion: cert-manager.io/v1
+  kind: ClusterIssuer
+  metadata:
+    name: letsencrypt-prod
+  spec:
+    acme:
+      server: https://acme-v02.api.letsencrypt.org/directory
+      email: you@example.com
+      privateKeySecretRef:
+        name: letsencrypt-prod-account-key
+      solvers:
+        - dns01:
+            webhook:
+              groupName: {{ .Values.groupName }}
+              solverName: autodns
+              config:
+                url: https://api.autodns.com/v1
+                context: "4"
+                nameserver: ns1.pns.de
+                usernameSecretRef:
+                  name: autodns-credentials
+                  key: username
+                passwordSecretRef:
+                  name: autodns-credentials
+                  key: password
+          selector:
+            dnsZones:
+              - example.com
+
+Make sure the referenced Secret(s) live in the release namespace ({{ .Release.Namespace }})
+and are listed under values.secretRefs so RBAC permits the webhook to read them.

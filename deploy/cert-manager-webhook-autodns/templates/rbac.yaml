@@ -10,7 +10,6 @@ metadata:
 ---
 # Grant the webhook permission to read the ConfigMap containing the Kubernetes
 # apiserver's requestheader-ca-certificate.
-# This ConfigMap is automatically created by the Kubernetes apiserver.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
@@ -52,7 +51,7 @@ subjects:
     name: {{ include "cert-manager-webhook-autodns.fullname" . }}
     namespace: {{ .Release.Namespace }}
 ---
-# Grant cert-manager permission to validate using our apiserver
+# Grant cert-manager permission to invoke our solver API
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -88,33 +87,32 @@ subjects:
     kind: ServiceAccount
     name: {{ .Values.certManager.serviceAccountName }}
     namespace: {{ .Values.certManager.namespace }}
-
-# grant permissions to read tls secrets
 ---
+# Grant the webhook permission to read the AutoDNS credentials secret(s) in the
+# release namespace. resourceNames whitelist comes from values.secretRefs.
+{{- if .Values.secretRefs }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "cert-manager-webhook-autodns.fullname" . }}:secret-reader
+  namespace: {{ .Release.Namespace }}
   labels:
     app: {{ include "cert-manager-webhook-autodns.name" . }}
     chart: {{ include "cert-manager-webhook-autodns.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  resourceNames:
-  - {{ include "cert-manager-webhook-autodns.fullname" . }}-secret
-  verbs:
-  - get
-  - watch
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+{{ toYaml .Values.secretRefs | indent 6 }}
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "cert-manager-webhook-autodns.fullname" . }}:secret-reader
+  namespace: {{ .Release.Namespace }}
   labels:
     app: {{ include "cert-manager-webhook-autodns.name" . }}
     chart: {{ include "cert-manager-webhook-autodns.chart" . }}
@@ -128,3 +126,5 @@ subjects:
   - apiGroup: ""
     kind: ServiceAccount
     name: {{ include "cert-manager-webhook-autodns.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
